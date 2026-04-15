@@ -6,10 +6,9 @@ use chromiumoxide::Browser;
 use kuchiki::traits::TendrilSink;
 use kuchiki::{ElementData, NodeDataRef, NodeRef};
 use log::{debug, error, info, warn};
-use mime_guess::mime;
 use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, StatusCode};
-use rss::{Channel, ChannelBuilder, EnclosureBuilder, GuidBuilder, Item, ItemBuilder};
+use rss::{Channel, ChannelBuilder, GuidBuilder, Item, ItemBuilder};
 use simple_eyre::eyre::{self, bail, eyre, WrapErr};
 use time::format_description::well_known::Rfc2822;
 use time::OffsetDateTime;
@@ -264,16 +263,8 @@ fn process_item(
         .permalink(false)
         .build();
 
-    let mut rss_item_builder = ItemBuilder::default();
-    rss_item_builder
-        .title(title_text)
-        .link(base_url.parse(link_url).ok().map(|u| u.to_string()))
-        .guid(Some(guid))
-        .pub_date(date.map(|date| date.format(&Rfc2822).unwrap()))
-        .description(description);
-
-    // Media enclosure
-    if let Some(media_selector) = &config.media {
+    // Extract media image URL to embed inline in description
+    let media_img = if let Some(media_selector) = &config.media {
         debug!("checking for media matching {media_selector}");
         match item.as_node().select_first(media_selector) {
             Ok(media) => {
@@ -283,37 +274,44 @@ fn process_item(
                     .or_else(|| media_attrs.get("href"))
                 {
                     match base_url.parse(media_url) {
-                        Ok(parsed_url) => {
-                            let media_mime_type = parsed_url
-                                .path_segments()
-                                .and_then(|segments| segments.last())
-                                .map(|media_filename| {
-                                    mime_guess::from_path(media_filename).first_or_octet_stream()
-                                })
-                                .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM);
-
-                            let mut enclosure_bld = EnclosureBuilder::default();
-                            enclosure_bld.url(parsed_url.to_string());
-                            enclosure_bld.mime_type(media_mime_type.to_string());
-                            // "When an enclosure's size cannot be determined, a publisher should use a length of 0."
-                            // https://www.rssboard.org/rss-profile#element-channel-item-enclosure
-                            enclosure_bld.length("0".to_string());
-
-                            rss_item_builder.enclosure(Some(enclosure_bld.build()));
-                        }
+                        Ok(parsed_url) => Some(parsed_url.to_string()),
                         Err(e) => {
-                            debug!("media enclosure url invalid: {e}");
+                            debug!("media url invalid: {e}");
+                            None
                         }
                     }
                 } else {
                     debug!("element selected as media has no 'src' or 'href' attribute");
+                    None
                 }
             }
             Err(()) => {
                 debug!("no element matching media selector '{media_selector}' found in item");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
+
+    // Build description with media image prepended
+    let description = match (media_img, description) {
+        (Some(img_url), Some(desc)) => {
+            Some(format!(r#"<img src="{img_url}" />{desc}"#))
+        }
+        (Some(img_url), None) => {
+            Some(format!(r#"<img src="{img_url}" />"#))
+        }
+        (None, desc) => desc,
+    };
+
+    let mut rss_item_builder = ItemBuilder::default();
+    rss_item_builder
+        .title(title_text)
+        .link(base_url.parse(link_url).ok().map(|u| u.to_string()))
+        .guid(Some(guid))
+        .pub_date(date.map(|date| date.format(&Rfc2822).unwrap()))
+        .description(description);
 
     Ok(rss_item_builder.build())
 }
@@ -547,6 +545,34 @@ mod tests {
     }
 
     #[test]
+    fn test_media_image_without_summary() {
+        let html = r#"<html><body><div class="item"><h2><a href="/post">Title</a></h2><img class="photo" src="/images/pic.jpg"></div></body></html>"#;
+        let doc = kuchiki::parse_html().one(html);
+        let base_url: Url = "http://example.com".parse().unwrap();
+        let base = Url::options().base_url(Some(&base_url));
+        rewrite_urls(&doc, &base).unwrap();
+        let item = doc.select_first(".item").unwrap();
+        let config = FeedConfig {
+            url: "http://example.com".to_string(),
+            item: ".item".to_string(),
+            heading: "h2".to_string(),
+            link: Some("h2 a".to_string()),
+            media: Some("img.photo".to_string()),
+            ..test_config()
+        };
+
+        let rss_item = process_item(&config, item, "h2 a", &base).unwrap();
+
+        // With no summary selectors, description should just be the image
+        let desc = rss_item.description().unwrap();
+        assert!(
+            desc.contains(r#"<img src="http://example.com/images/pic.jpg""#),
+            "description should contain the media image, got: {desc}"
+        );
+        assert!(rss_item.enclosure().is_none(), "should not use enclosure");
+    }
+
+    #[test]
     fn test_process_local_html() {
         let html_file_name = format!("rsspls.local.{}.html", process::id());
         let local_html = RmOnDrop::new(env::temp_dir().join(&html_file_name));
@@ -729,16 +755,32 @@ mod tests {
             Some("file:///posts/second")
         );
 
-        // First item: media enclosure with MIME type guessed from extension
-        let enclosure1 = items[0].enclosure().expect("first item should have a media enclosure");
-        assert_eq!(enclosure1.url(), "file:///images/photo1.jpg");
-        assert_eq!(enclosure1.mime_type(), "image/jpeg");
-
-        // Second item: no media element, but item should still be included
+        // First item: media image embedded in description
+        let desc1 = items[0].description().unwrap();
         assert!(
-            items[1].enclosure().is_none(),
-            "second item has no media element so it should have no enclosure"
+            desc1.contains(r#"<img src="file:///images/photo1.jpg""#),
+            "first item description should contain an img tag with the media URL, got: {desc1}"
         );
+        assert!(
+            desc1.contains("first post summary"),
+            "first item description should still contain the summary text"
+        );
+        // Image should come before the summary text
+        let img_pos = desc1.find("<img").unwrap();
+        let summary_pos = desc1.find("first post summary").unwrap();
+        assert!(
+            img_pos < summary_pos,
+            "image should be prepended before the summary"
+        );
+        // No enclosure should be set
+        assert!(
+            items[0].enclosure().is_none(),
+            "media images should be inline, not enclosures"
+        );
+
+        // Second item: no media element, description should just have summary
+        let desc2 = items[1].description().unwrap();
+        assert!(!desc2.contains("<img"), "second item should have no img tag");
 
         // Third item: absolute URL preserved
         assert_eq!(items[2].title(), Some("Third Post"));
@@ -746,9 +788,11 @@ mod tests {
             items[2].link(),
             Some("https://example.com/posts/absolute")
         );
-        let enclosure3 = items[2].enclosure().expect("third item should have a media enclosure");
-        assert_eq!(enclosure3.url(), "file:///images/photo3.jpg");
-        assert_eq!(enclosure3.mime_type(), "image/jpeg");
+        let desc3 = items[2].description().unwrap();
+        assert!(
+            desc3.contains(r#"<img src="file:///images/photo3.jpg""#),
+            "third item description should contain an img tag"
+        );
 
         // All items should have GUIDs
         for (i, item) in items.iter().enumerate() {

@@ -1902,7 +1902,6 @@ dependencies = [
  "futures",
  "kuchiki",
  "log",
- "mime_guess",
  "pico-args",
  "pretty_env_logger",
  "reqwest 0.12.5",
