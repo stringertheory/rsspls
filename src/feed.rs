@@ -231,36 +231,44 @@ fn process_item(
     // Media enclosure
     if let Some(media_selector) = &config.media {
         debug!("checking for media matching {media_selector}");
-        let media = item
-            .as_node()
-            .select_first(media_selector)
-            .map_err(|()| eyre!("invalid selector for media: {}", media_selector))?;
+        match item.as_node().select_first(media_selector) {
+            Ok(media) => {
+                let media_attrs = media.attributes.borrow();
+                if let Some(media_url) = media_attrs
+                    .get("src")
+                    .or_else(|| media_attrs.get("href"))
+                {
+                    match base_url.parse(media_url) {
+                        Ok(parsed_url) => {
+                            let media_mime_type = parsed_url
+                                .path_segments()
+                                .and_then(|segments| segments.last())
+                                .map(|media_filename| {
+                                    mime_guess::from_path(media_filename).first_or_octet_stream()
+                                })
+                                .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM);
 
-        let media_attrs = media.attributes.borrow();
-        let media_url = media_attrs
-            .get("src")
-            .or_else(|| media_attrs.get("href"))
-            .ok_or_else(|| eyre!("element selected as media has no 'src' or 'href' attribute"))?;
+                            let mut enclosure_bld = EnclosureBuilder::default();
+                            enclosure_bld.url(parsed_url.to_string());
+                            enclosure_bld.mime_type(media_mime_type.to_string());
+                            // "When an enclosure's size cannot be determined, a publisher should use a length of 0."
+                            // https://www.rssboard.org/rss-profile#element-channel-item-enclosure
+                            enclosure_bld.length("0".to_string());
 
-        let parsed_url = base_url
-            .parse(media_url)
-            .map_err(|e| eyre!("media enclosure url invalid: {e}"))?;
-
-        // Guessing the MIME type from the url as we don't have the full media
-        let media_mime_type = parsed_url
-            .path_segments()
-            .and_then(|segments| segments.last())
-            .map(|media_filename| mime_guess::from_path(media_filename).first_or_octet_stream())
-            .unwrap_or_else(|| mime::APPLICATION_OCTET_STREAM);
-
-        let mut enclosure_bld = EnclosureBuilder::default();
-        enclosure_bld.url(parsed_url.to_string());
-        enclosure_bld.mime_type(media_mime_type.to_string());
-        // "When an enclosure's size cannot be determined, a publisher should use a length of 0."
-        // https://www.rssboard.org/rss-profile#element-channel-item-enclosure
-        enclosure_bld.length("0".to_string());
-
-        rss_item_builder.enclosure(Some(enclosure_bld.build()));
+                            rss_item_builder.enclosure(Some(enclosure_bld.build()));
+                        }
+                        Err(e) => {
+                            debug!("media enclosure url invalid: {e}");
+                        }
+                    }
+                } else {
+                    debug!("element selected as media has no 'src' or 'href' attribute");
+                }
+            }
+            Err(()) => {
+                debug!("no element matching media selector '{media_selector}' found in item");
+            }
+        }
     }
 
     Ok(rss_item_builder.build())
@@ -580,5 +588,125 @@ mod tests {
         assert!(err
             .to_string()
             .contains("file URLs are not enabled in config"));
+    }
+
+    #[test]
+    fn test_end_to_end_feed_content() {
+        let blog_html = r#"<!DOCTYPE html>
+<html>
+<body>
+  <div class="posts">
+    <article class="post">
+      <h2><a href="/posts/first">First Post</a></h2>
+      <time datetime="2024-03-15T10:00:00+00:00">March 15, 2024</time>
+      <p class="summary">This is the first post summary.</p>
+      <img class="media" src="/images/photo1.jpg">
+    </article>
+    <article class="post">
+      <h2><a href="/posts/second">Second Post</a></h2>
+      <time datetime="2024-03-10T09:00:00+00:00">March 10, 2024</time>
+      <p class="summary">This is the second post summary.</p>
+    </article>
+    <article class="post">
+      <h2><a href="https://example.com/posts/absolute">Third Post</a></h2>
+      <time datetime="2024-03-05T08:00:00+00:00">March 5, 2024</time>
+      <p class="summary">This is the third post summary.</p>
+      <img class="media" src="/images/photo3.jpg">
+    </article>
+  </div>
+</body>
+</html>"#;
+
+        let html_file_name = format!("rsspls.e2e.{}.html", process::id());
+        let local_html = RmOnDrop::new(env::temp_dir().join(&html_file_name));
+        fs::write(local_html.path(), blog_html.as_bytes()).expect("unable to write test HTML");
+
+        let url = Url::from_file_path(local_html.path())
+            .expect("unable to construct file URL for test HTML");
+
+        let client = Client {
+            file_urls: true,
+            http: HttpClient::new(),
+        };
+
+        let config = FeedConfig {
+            url: url.to_string(),
+            item: "article.post".to_string(),
+            heading: "h2".to_string(),
+            link: Some("h2 a".to_string()),
+            summary: vec!["p.summary".to_string()],
+            date: Some("time".parse().unwrap()),
+            media: Some("img.media".to_string()),
+        };
+        let channel_config = ChannelConfig {
+            title: "Test Blog".to_string(),
+            filename: "test-blog.rss".to_string(),
+            user_agent: None,
+            config,
+        };
+        let config_hash = ConfigHash("testhash");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let res = runtime
+            .block_on(process_feed(&client, &channel_config, config_hash, &None))
+            .expect("unable to process feed");
+
+        let ProcessResult::Ok { channel, .. } = res else {
+            panic!("expected ProcessResult::Ok but got: {:?}", res)
+        };
+
+        // Channel metadata
+        assert_eq!(channel.title(), "Test Blog");
+
+        // Correct number of items
+        let items = channel.items();
+        assert_eq!(items.len(), 3);
+
+        // First item: title, link (relative URL rewritten to absolute), date, description
+        assert_eq!(items[0].title(), Some("First Post"));
+        assert_eq!(
+            items[0].link(),
+            Some("file:///posts/first")
+        );
+        assert!(items[0].pub_date().is_some(), "first item should have a date");
+        assert!(
+            items[0].description().unwrap().contains("first post summary"),
+            "first item description should contain summary text"
+        );
+
+        // Second item
+        assert_eq!(items[1].title(), Some("Second Post"));
+        assert_eq!(
+            items[1].link(),
+            Some("file:///posts/second")
+        );
+
+        // First item: media enclosure with MIME type guessed from extension
+        let enclosure1 = items[0].enclosure().expect("first item should have a media enclosure");
+        assert_eq!(enclosure1.url(), "file:///images/photo1.jpg");
+        assert_eq!(enclosure1.mime_type(), "image/jpeg");
+
+        // Second item: no media element, but item should still be included
+        assert!(
+            items[1].enclosure().is_none(),
+            "second item has no media element so it should have no enclosure"
+        );
+
+        // Third item: absolute URL preserved
+        assert_eq!(items[2].title(), Some("Third Post"));
+        assert_eq!(
+            items[2].link(),
+            Some("https://example.com/posts/absolute")
+        );
+        let enclosure3 = items[2].enclosure().expect("third item should have a media enclosure");
+        assert_eq!(enclosure3.url(), "file:///images/photo3.jpg");
+        assert_eq!(enclosure3.mime_type(), "image/jpeg");
+
+        // All items should have GUIDs
+        for (i, item) in items.iter().enumerate() {
+            assert!(item.guid().is_some(), "item {i} should have a GUID");
+        }
     }
 }
