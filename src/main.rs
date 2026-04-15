@@ -1,7 +1,7 @@
 mod cache;
 mod cli;
-mod config;
-mod feed;
+pub mod config;
+pub mod feed;
 
 #[cfg(windows)]
 mod dirs;
@@ -19,8 +19,10 @@ use std::time::Duration;
 use std::{env, fs};
 
 use atomicwrites::AtomicFile;
+use chromiumoxide::Browser;
 use eyre::{eyre, Report, WrapErr};
 use futures::future;
+use futures::StreamExt;
 use log::{debug, error, info};
 use reqwest::Client as HttpClient;
 use rss::Channel;
@@ -141,6 +143,35 @@ async fn try_main() -> eyre::Result<bool> {
     let dirs = dirs::new()?;
     let dirs = Arc::new(Mutex::new(dirs));
 
+    // Launch headless browser if any feed needs it
+    let browser: Option<Arc<Browser>> = if config.feed.iter().any(|f| f.config.browser) {
+        use chromiumoxide::browser::BrowserConfig;
+        let (browser, mut handler) = Browser::launch(
+            BrowserConfig::builder()
+                .arg("--headless")
+                .arg("--disable-gpu")
+                .arg("--no-sandbox")
+                .build()
+                .map_err(|e| eyre!("failed to configure browser: {}", e))?,
+        )
+        .await
+        .wrap_err("failed to launch headless browser")?;
+
+        // The CDP handler must be polled continuously
+        tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        info!("launched headless browser for browser-rendered feeds");
+        Some(Arc::new(browser))
+    } else {
+        None
+    };
+
     // Spawn the tasks
     let config_hash = Arc::new(config.hash.clone());
     let futures = config.feed.into_iter().map(|feed| {
@@ -148,6 +179,7 @@ async fn try_main() -> eyre::Result<bool> {
         let output_dir = output_dir.clone();
         let dirs = Arc::clone(&dirs);
         let config_hash = Arc::clone(&config_hash);
+        let browser = browser.clone();
         tokio::spawn(async move {
             let res = process(
                 &feed,
@@ -155,6 +187,7 @@ async fn try_main() -> eyre::Result<bool> {
                 ConfigHash(config_hash.as_str()),
                 output_dir,
                 dirs,
+                browser,
             )
             .await;
             if let Err(ref report) = res {
@@ -183,6 +216,7 @@ async fn process(
     config_hash: ConfigHash<'_>,
     output_dir: PathBuf,
     dirs: Dirs,
+    browser: Option<Arc<Browser>>,
 ) -> Result<(), Report> {
     // Generate paths up front so we report any errors before making requests
     let filename = Path::new(&feed.filename);
@@ -199,7 +233,7 @@ async fn process(
     }?;
     let cached_headers = deserialise_cached_headers(&cache_path, config_hash);
 
-    process_feed(client, feed, config_hash, &cached_headers)
+    process_feed(client, feed, config_hash, &cached_headers, browser.as_ref())
         .await
         .and_then(|ref process_result| {
             match process_result {

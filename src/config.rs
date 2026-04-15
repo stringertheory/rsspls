@@ -59,6 +59,8 @@ pub struct FeedConfig {
     #[serde(default, deserialize_with = "opt_string_or_struct")]
     pub date: Option<DateConfig>,
     pub media: Option<String>,
+    #[serde(default)]
+    pub browser: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -338,5 +340,42 @@ mod tests {
             .parse("Friday, January 8th, 2021 12:13pm").is_ok());
         assert!(test_date("[weekday case_sensitive:false], [month repr:long case_sensitive:false] [day padding:none], [year] [hour repr:24]:[minute]")
             .parse("Friday, January 8, 2021 21:33").is_ok());
+    }
+
+    #[test]
+    fn test_browser_defaults_to_false() {
+        let toml = r#"
+            [rsspls]
+
+            [[feed]]
+            title = "Test"
+            filename = "test.rss"
+
+            [feed.config]
+            url = "https://example.com"
+            item = "div"
+            heading = "h2"
+        "#;
+        let config: Config = basic_toml::from_str(toml).unwrap();
+        assert!(!config.feed[0].config.browser);
+    }
+
+    #[test]
+    fn test_browser_true() {
+        let toml = r#"
+            [rsspls]
+
+            [[feed]]
+            title = "Test"
+            filename = "test.rss"
+
+            [feed.config]
+            url = "https://example.com"
+            item = "div"
+            heading = "h2"
+            browser = true
+        "#;
+        let config: Config = basic_toml::from_str(toml).unwrap();
+        assert!(config.feed[0].config.browser);
     }
 }

@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::{fs, mem};
 
 use basic_toml as toml;
+use chromiumoxide::Browser;
 use kuchiki::traits::TendrilSink;
 use kuchiki::{ElementData, NodeDataRef, NodeRef};
 use log::{debug, error, info, warn};
@@ -40,6 +42,7 @@ pub async fn process_feed(
     channel_config: &ChannelConfig,
     config_hash: ConfigHash<'_>,
     cached_headers: &Option<HeaderMap>,
+    browser: Option<&Arc<Browser>>,
 ) -> eyre::Result<ProcessResult> {
     let config = &channel_config.config;
     info!("processing {}", config.url);
@@ -49,7 +52,9 @@ pub async fn process_feed(
         .wrap_err_with(|| format!("unable to parse {} as a URL", config.url))?;
 
     let (html, serialised_headers) =
-        match fetch_webpage(client, &url, cached_headers, channel_config, config_hash).await? {
+        match fetch_webpage(client, &url, cached_headers, channel_config, config_hash, browser)
+            .await?
+        {
             FetchResult::Ok { html, headers } => (html, headers),
             FetchResult::NotModified => return Ok(ProcessResult::NotModified),
         };
@@ -96,7 +101,12 @@ async fn fetch_webpage(
     cached_headers: &Option<HeaderMap>,
     channel_config: &ChannelConfig,
     config_hash: ConfigHash<'_>,
+    browser: Option<&Arc<Browser>>,
 ) -> eyre::Result<FetchResult> {
+    if channel_config.config.browser {
+        return fetch_webpage_browser(browser, url).await;
+    }
+
     if url.scheme() == "file" {
         if client.file_urls {
             fetch_webpage_local(url).await
@@ -186,6 +196,40 @@ async fn fetch_webpage_local(url: &Url) -> eyre::Result<FetchResult> {
     })
     .await
     .wrap_err_with(|| format!("error joining task for {url}"))??;
+
+    Ok(FetchResult::Ok {
+        html,
+        headers: None,
+    })
+}
+
+async fn fetch_webpage_browser(
+    browser: Option<&Arc<Browser>>,
+    url: &Url,
+) -> eyre::Result<FetchResult> {
+    let browser = browser
+        .ok_or_else(|| eyre!("feed has browser = true but no browser instance is available"))?;
+
+    info!("fetching with browser: {}", url);
+
+    let page = browser
+        .new_page(url.as_str())
+        .await
+        .wrap_err_with(|| format!("failed to open page in browser: {}", url))?;
+
+    // Wait for the page to be fully loaded (waits for the load event)
+    page.wait_for_navigation()
+        .await
+        .wrap_err("failed waiting for page navigation")?;
+
+    // Extract the rendered DOM as HTML
+    let html = page
+        .content()
+        .await
+        .wrap_err("failed to get page content from browser")?;
+
+    // Close the tab to free resources
+    page.close().await.wrap_err("failed to close browser page")?;
 
     Ok(FetchResult::Ok {
         html,
@@ -439,6 +483,7 @@ mod tests {
             summary: Vec::new(),
             date: None,
             media: None,
+            browser: false,
         }
     }
 
@@ -536,7 +581,7 @@ mod tests {
             .build()
             .unwrap();
         let res = runtime
-            .block_on(process_feed(&client, &channel_config, config_hash, &None))
+            .block_on(process_feed(&client, &channel_config, config_hash, &None, None))
             .expect("unable to process local feed");
 
         let ProcessResult::Ok { channel, .. } = res else {
@@ -579,7 +624,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let res = runtime.block_on(process_feed(&client, &channel_config, config_hash, &None));
+        let res = runtime.block_on(process_feed(&client, &channel_config, config_hash, &None, None));
 
         let Err(err) = res else {
             panic!("expected error, got: {:?}", res)
@@ -637,6 +682,7 @@ mod tests {
             summary: vec!["p.summary".to_string()],
             date: Some("time".parse().unwrap()),
             media: Some("img.media".to_string()),
+            browser: false,
         };
         let channel_config = ChannelConfig {
             title: "Test Blog".to_string(),
@@ -650,7 +696,7 @@ mod tests {
             .build()
             .unwrap();
         let res = runtime
-            .block_on(process_feed(&client, &channel_config, config_hash, &None))
+            .block_on(process_feed(&client, &channel_config, config_hash, &None, None))
             .expect("unable to process feed");
 
         let ProcessResult::Ok { channel, .. } = res else {
@@ -708,5 +754,174 @@ mod tests {
         for (i, item) in items.iter().enumerate() {
             assert!(item.guid().is_some(), "item {i} should have a GUID");
         }
+    }
+
+    /// HTML page whose content is populated entirely by JavaScript.
+    const JS_RENDERED_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><title>JS Blog</title></head>
+<body>
+  <div id="posts"></div>
+  <script>
+    document.getElementById("posts").innerHTML = `
+      <article class="post">
+        <h2><a href="/posts/dynamic-one">Dynamic Post One</a></h2>
+        <p class="summary">This content was rendered by JavaScript.</p>
+      </article>
+      <article class="post">
+        <h2><a href="/posts/dynamic-two">Dynamic Post Two</a></h2>
+        <p class="summary">This is another JS-rendered post.</p>
+      </article>
+    `;
+  </script>
+</body>
+</html>"#;
+
+    async fn start_test_server() -> std::net::SocketAddr {
+        use warp::Filter;
+        let route = warp::any().map(|| warp::reply::html(JS_RENDERED_HTML));
+        let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+        tokio::spawn(server);
+        addr
+    }
+
+    async fn launch_test_browser() -> (Arc<Browser>, tokio::task::JoinHandle<()>, tempfile::TempDir)
+    {
+        use chromiumoxide::browser::BrowserConfig;
+        use futures::StreamExt;
+
+        let user_data_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let (browser, mut handler) = Browser::launch(
+            BrowserConfig::builder()
+                .arg("--headless")
+                .arg("--disable-gpu")
+                .arg("--no-sandbox")
+                .user_data_dir(user_data_dir.path())
+                .build()
+                .expect("failed to build browser config"),
+        )
+        .await
+        .expect("failed to launch browser");
+
+        let handle = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        (Arc::new(browser), handle, user_data_dir)
+    }
+
+    #[tokio::test]
+    async fn test_browser_renders_js_content() {
+        let addr = start_test_server().await;
+        let url_str = format!("http://127.0.0.1:{}", addr.port());
+        let (browser, _handle, _dir) = launch_test_browser().await;
+
+        let client = Client {
+            file_urls: false,
+            http: HttpClient::new(),
+        };
+
+        let config = FeedConfig {
+            url: url_str,
+            item: "article.post".to_string(),
+            heading: "h2".to_string(),
+            link: Some("h2 a".to_string()),
+            summary: vec!["p.summary".to_string()],
+            date: None,
+            media: None,
+            browser: true,
+        };
+        let channel_config = ChannelConfig {
+            title: "JS Blog".to_string(),
+            filename: "js-blog.rss".to_string(),
+            user_agent: None,
+            config,
+        };
+        let config_hash = ConfigHash("testhash");
+
+        let res = process_feed(
+            &client,
+            &channel_config,
+            config_hash,
+            &None,
+            Some(&browser),
+        )
+        .await
+        .expect("process_feed failed");
+
+        let ProcessResult::Ok { channel, .. } = res else {
+            panic!("expected ProcessResult::Ok");
+        };
+
+        let items = channel.items();
+        assert_eq!(items.len(), 2, "should find 2 JS-rendered articles");
+        assert_eq!(items[0].title(), Some("Dynamic Post One"));
+        assert_eq!(items[1].title(), Some("Dynamic Post Two"));
+        assert!(
+            items[0]
+                .description()
+                .unwrap()
+                .contains("rendered by JavaScript"),
+            "first item description should contain JS-rendered text"
+        );
+        assert!(
+            items[0].link().unwrap().contains("/posts/dynamic-one"),
+            "first item link should be resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_browser_reuse_across_feeds() {
+        let addr = start_test_server().await;
+        let url_str = format!("http://127.0.0.1:{}", addr.port());
+        let (browser, _handle, _dir) = launch_test_browser().await;
+
+        let client = Client {
+            file_urls: false,
+            http: HttpClient::new(),
+        };
+
+        let make_channel_config = |title: &str, filename: &str| ChannelConfig {
+            title: title.to_string(),
+            filename: filename.to_string(),
+            user_agent: None,
+            config: FeedConfig {
+                url: url_str.clone(),
+                item: "article.post".to_string(),
+                heading: "h2".to_string(),
+                link: Some("h2 a".to_string()),
+                summary: vec!["p.summary".to_string()],
+                date: None,
+                media: None,
+                browser: true,
+            },
+        };
+
+        let config_hash = ConfigHash("testhash");
+        let feed1 = make_channel_config("Feed One", "feed1.rss");
+        let feed2 = make_channel_config("Feed Two", "feed2.rss");
+
+        let res1 = process_feed(&client, &feed1, config_hash, &None, Some(&browser))
+            .await
+            .expect("feed1 failed");
+        let res2 = process_feed(&client, &feed2, config_hash, &None, Some(&browser))
+            .await
+            .expect("feed2 failed");
+
+        let ProcessResult::Ok { channel: ch1, .. } = res1 else {
+            panic!("feed1: expected Ok");
+        };
+        let ProcessResult::Ok { channel: ch2, .. } = res2 else {
+            panic!("feed2: expected Ok");
+        };
+
+        assert_eq!(ch1.items().len(), 2);
+        assert_eq!(ch2.items().len(), 2);
+        assert_eq!(ch1.title(), "Feed One");
+        assert_eq!(ch2.title(), "Feed Two");
     }
 }
